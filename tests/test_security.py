@@ -20,9 +20,9 @@ def git(*a, cwd=None):
 
 class Home(unittest.TestCase):
     def setUp(self):
-        self.h = Path(tempfile.mkdtemp(prefix="glhome-"))
+        self.h = Path(tempfile.mkdtemp(prefix="glhome-")).resolve()
         (self.h / "work" / "jobs" / "j").mkdir(parents=True)
-        self.outside = Path(tempfile.mkdtemp(prefix="outside-"))
+        self.outside = Path(tempfile.mkdtemp(prefix="outside-")).resolve()
         os.environ["AGENT_HOME"] = str(self.h)
 
     def tearDown(self):
@@ -57,7 +57,45 @@ class DownloadLinkTest(Home):
         self.assertEqual(list(self.outside.iterdir()), [])
 
 
+class SwappedFolderTest(Home):
+    """The path check passes, then the agent swaps a folder on the path for a link (a race with a background job).
+    inside_work is patched to return the checked, unresolved path, as if the swap happened right after the check."""
+
+    def swap(self):
+        jobs = self.h / "work/jobs"
+        (jobs / "j").rename(jobs / "j-old")
+        (jobs / "j").symlink_to(self.outside, target_is_directory=True)
+        return jobs / "j"
+
+    def test_walk_refuses_swapped_component(self):
+        d = self.swap()
+        with mock.patch.object(glcli, "inside_work", lambda p: Path(p)):
+            with self.assertRaises(OSError):
+                glcli.open_work_dir(str(d))
+
+    def test_body_file_never_read_through_a_link(self):
+        secret = self.outside / "env"
+        secret.write_text("GITLAB_TOKEN=x")
+        (self.h / "work/jobs/j/body.md").symlink_to(secret)
+        with self.assertRaises((ValueError, OSError)):
+            glcli.read_body_file(str(self.h / "work/jobs/j/body.md"))
+        d = self.swap()
+        (self.outside / "body.md").write_text("secret")
+        with mock.patch.object(glcli, "inside_work", lambda p: Path(p)):
+            with self.assertRaises(OSError):
+                glcli.read_body_file(str(d / "body.md"))
+
+
 class KbGrantTest(Home):
+    def test_expired_grant_is_refused(self):
+        token = runner.issue_kb_grant(self.h)
+        os.environ["GL_KB_GRANT"] = token
+        f = self.h / "state/kb-grants" / token
+        old = f.stat().st_mtime - glcli.GRANT_TTL - 60
+        os.utime(f, (old, old))
+        self.assertFalse(glcli.kb_grant_valid())
+
+
     def test_grant_needs_env_and_file(self):
         self.assertFalse(glcli.kb_grant_valid())
         token = runner.issue_kb_grant(self.h)
@@ -137,6 +175,34 @@ class KbPushTest(Home):
                     glcli.push_repo(self.kb, "acme/kb", "main", remote_base=self.base, kb_main=True)
                 git("reset", "-q", "--hard", "HEAD~1", cwd=self.kb)
         self.assertEqual(git("show", "main:CLAUDE.md", cwd=self.remote / "acme/kb.git"), "rules")
+
+    def refused(self):
+        with self.assertRaises(ValueError):
+            glcli.push_repo(self.kb, "acme/kb", "main", remote_base=self.base, kb_main=True)
+        git("reset", "-q", "--hard", "origin/main", cwd=self.kb)
+
+    def test_rename_or_delete_of_the_prompt_is_refused(self):
+        git("mv", "CLAUDE.md", "notes.md", cwd=self.kb)
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "rename", cwd=self.kb)
+        self.refused()
+        git("rm", "-q", "CLAUDE.md", cwd=self.kb)
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "delete", cwd=self.kb)
+        self.refused()
+
+    def test_only_documents_go_to_main(self):
+        for name in ("scripts/скрипт.py", "docs/CLAUDE.md", "docs/claude.local.md", ".claude/skills/x/SKILL.md",
+                     "CODEOWNERS", "taxonomy.yaml", "tests/x.md", "ci/include.yml"):
+            with self.subTest(name=name):
+                self.commit(name, "x")
+                self.refused()
+        self.commit("docs/new-doc.md", "ok")
+        glcli.push_repo(self.kb, "acme/kb", "main", remote_base=self.base, kb_main=True)
+
+    def test_link_disguised_as_document_is_refused(self):
+        os.symlink("../../secrets/env", Path(self.kb) / "evil.md")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "add", "-A", cwd=self.kb)
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "link", cwd=self.kb)
+        self.refused()
 
     def test_cli_push_uses_the_grant(self):
         self.commit("doc.md", "v2")

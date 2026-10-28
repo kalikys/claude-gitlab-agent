@@ -26,8 +26,11 @@ import argparse
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -363,8 +366,8 @@ def download(g: GitLab, project: str, ref: str, dest_dir: str) -> str:
         raise ValueError(f"{d} is not a folder")
     data = g.get_bytes(f"projects/{pid}/uploads/{secret}/{urllib.parse.quote(name, safe='')}")
     # gl.py runs outside the sandbox, the agent can write inside work/: never follow a link it planted.
-    # The folder is opened once without following links, the file is created relative to it, exclusively.
-    dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    # The folder is reached from the work root without following links, the file is created in it, exclusively.
+    dfd, d = open_work_dir(dest_dir)
     try:
         base, n = safe_name(name), 1
         candidate = base
@@ -462,6 +465,23 @@ def inside_work(path: str) -> Path:
     return real
 
 
+def open_work_dir(path) -> tuple[int, Path]:
+    """Open a folder inside work/ walking from the work root one component at a time with O_NOFOLLOW, so a link
+    the agent swaps in after the path check cannot redirect gl.py outside the sandbox. Returns (fd, path)."""
+    real = inside_work(str(path))
+    root = (agent_home() / "work").resolve()
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in real.relative_to(root).parts:
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, real
+
+
 def check_group(project: str) -> None:
     group = config.group()
     if not project.startswith(group + "/") or ".." in project:
@@ -491,24 +511,53 @@ def clone_repo(project: str, dest: str, remote_base: str = "https://gitlab.com")
     """Clone a group repo into the work folder (the agent's own git has no network and no token)."""
     check_group(project)
     target = inside_work(dest)
-    if target.exists():
+    if os.path.lexists(target):
         raise ValueError(f"{target} уже существует")
-    _git("clone", "-q", f"{remote_base}/{project}.git", str(target))
+    # Clone where the agent cannot write (cache/), then move it into place through a folder reached without links.
+    tmp = Path(tempfile.mkdtemp(prefix="clone-", dir=_cache_dir()))
+    try:
+        _git("clone", "-q", f"{remote_base}/{project}.git", str(tmp / "repo"))
+        pfd, _ = open_work_dir(target.parent)
+        try:
+            os.rename(tmp / "repo", target.name, dst_dir_fd=pfd)
+        finally:
+            os.close(pfd)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     return str(target)
 
 
+def _cache_dir() -> Path:
+    d = agent_home() / "cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 KB_PROJECT = config.kb_project()
-# Files of the knowledge base that steer the agent (CLAUDE.md is appended to every run's system prompt) or run
-# code (scripts, CI). A push straight to main never changes them: they change only through a merge request.
-KB_PROTECTED = ("CLAUDE.md", "scripts/", ".gitlab-ci.yml", ".gitlab/")
 GRANT = re.compile(r"^[0-9a-f]{32}$")
+GRANT_TTL = 2 * 3600  # longer than a run (30 min), so a grant left by a crashed worker dies on its own
 
 
 def kb_grant_valid() -> bool:
     """The worker grants a run the right to push to main of the knowledge base (approved / inbox / stale jobs) by
     a file in state/, which the sandbox can neither read nor write, named after a token in the run's environment."""
     token = os.environ.get("GL_KB_GRANT", "")
-    return bool(GRANT.match(token)) and (agent_home() / "state" / "kb-grants" / token).is_file()
+    if not GRANT.match(token):
+        return False
+    try:
+        st = os.stat(agent_home() / "state" / "kb-grants" / token, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and time.time() - st.st_mtime < GRANT_TTL
+
+
+def kb_path_ok(path: str) -> bool:
+    """main of the knowledge base takes documents only: Markdown outside hidden folders, code and tests, and never
+    the agent's instructions (CLAUDE*.md at any depth; the root one is appended to every run's system prompt).
+    Everything else (scripts, CI, CODEOWNERS, configuration) changes only through a merge request."""
+    parts = path.split("/")
+    return (path.endswith(".md") and not any(p.startswith(".") for p in parts)
+            and not parts[-1].lower().startswith("claude") and parts[0] not in ("scripts", "tests"))
 
 
 def push_allowed(project: str, branch: str, kb_main: bool = False) -> bool:
@@ -518,11 +567,18 @@ def push_allowed(project: str, branch: str, kb_main: bool = False) -> bool:
     return branch.startswith("claude/")
 
 
-def protected_changes(cache: Path, remote: str) -> list[str]:
-    """Paths under KB_PROTECTED that the outgoing commits change compared with the remote main."""
+def kb_push_violations(cache: Path, remote: str) -> list[str]:
+    """Paths the outgoing commits change against the remote main that main may not take: not a document, or a link
+    or a submodule. Raw, NUL-separated, without rename detection, so quoting and renames cannot hide a path."""
     _git("fetch", "-q", "--no-tags", remote, "+refs/heads/main:refs/heads/base", cwd=cache)
-    changed = _git("diff", "--name-only", "base", "outgoing", cwd=cache).stdout.split()
-    return [p for p in changed if p in KB_PROTECTED or any(p.startswith(d) for d in KB_PROTECTED if d.endswith("/"))]
+    raw = _git("-c", "core.quotePath=false", "diff", "--raw", "-z", "--no-renames", "--no-abbrev",
+               "base", "outgoing", cwd=cache).stdout
+    fields, bad = raw.split("\0"), []
+    for meta, path in zip(fields[0::2], fields[1::2]):
+        new_mode = meta.lstrip(":").split()[1] if meta.startswith(":") else ""
+        if new_mode in ("120000", "160000") or not kb_path_ok(path):
+            bad.append(path)
+    return bad
 
 
 def push_repo(src: str, project: str, branch: str, remote_base: str = "https://gitlab.com",
@@ -544,9 +600,9 @@ def push_repo(src: str, project: str, branch: str, remote_base: str = "https://g
         _git("init", "-q", "--bare", str(cache))
         _git("fetch", "-q", "--no-tags", str(repo), "+HEAD:refs/heads/outgoing", cwd=cache)
         if project == KB_PROJECT and branch == "main":
-            touched = protected_changes(cache, f"{remote_base}/{project}.git")
+            touched = kb_push_violations(cache, f"{remote_base}/{project}.git")
             if touched:
-                raise ValueError(f"push to {project}:main may not change {', '.join(touched)}: "
+                raise ValueError(f"push to {project}:main takes documents only, not {', '.join(touched)}: "
                                  "open a claude/<iid>-<slug> branch and a merge request")
         _git("push", "-q", f"{remote_base}/{project}.git", f"refs/heads/outgoing:refs/heads/{branch}", cwd=cache)
         return _git("rev-parse", "refs/heads/outgoing", cwd=cache).stdout.strip()
@@ -555,8 +611,16 @@ def push_repo(src: str, project: str, branch: str, remote_base: str = "https://g
 
 
 def read_body_file(path: str) -> str:
-    """Read a message body, but only from inside <AGENT_HOME>/work (symlinks resolved)."""
-    return inside_work(path).read_text(encoding="utf-8")
+    """Read a message body, but only from inside <AGENT_HOME>/work, never through a link (the text is posted to
+    GitLab, so a link to a secret would leak it)."""
+    real = inside_work(path)
+    dfd, _ = open_work_dir(real.parent)
+    try:
+        fd = os.open(real.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+    finally:
+        os.close(dfd)
+    with os.fdopen(fd, encoding="utf-8") as f:
+        return f.read()
 
 
 def client() -> GitLab:
