@@ -616,9 +616,13 @@ def read_body_file(path: str) -> str:
     real = inside_work(path)
     dfd, _ = open_work_dir(real.parent)
     try:
-        fd = os.open(real.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        fd = os.open(real.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
     finally:
         os.close(dfd)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:  # a FIFO, a device, or a hard link to another file
+        os.close(fd)
+        raise ValueError(f"{real} is not a plain file")
     with os.fdopen(fd, encoding="utf-8") as f:
         return f.read()
 

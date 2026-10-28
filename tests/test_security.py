@@ -86,6 +86,20 @@ class SwappedFolderTest(Home):
                 glcli.read_body_file(str(d / "body.md"))
 
 
+class BodyFileKindTest(Home):
+    def test_hard_link_and_fifo_refused(self):
+        secret = self.outside / "env"
+        secret.write_text("GITLAB_TOKEN=x")
+        os.link(secret, self.h / "work/jobs/j/hard.md")
+        with self.assertRaises(ValueError):
+            glcli.read_body_file(str(self.h / "work/jobs/j/hard.md"))
+        os.mkfifo(self.h / "work/jobs/j/pipe.md")
+        with self.assertRaises(ValueError):
+            glcli.read_body_file(str(self.h / "work/jobs/j/pipe.md"))
+        (self.h / "work/jobs/j/ok.md").write_text("hello")
+        self.assertEqual(glcli.read_body_file(str(self.h / "work/jobs/j/ok.md")), "hello")
+
+
 class KbGrantTest(Home):
     def test_expired_grant_is_refused(self):
         token = runner.issue_kb_grant(self.h)
