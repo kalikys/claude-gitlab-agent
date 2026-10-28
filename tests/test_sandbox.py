@@ -131,6 +131,7 @@ class PushTargetTest(CloneOnlyTest):
                 glcli.push_repo(dest, "acme/repo", branch, remote_base=f"file://{self.remote_base}")
         self.assertFalse(glcli.push_allowed("acme/gitlab-agent", "main"))
         self.assertTrue(glcli.push_allowed("acme/gitlab-agent", "claude/2-mcp"))
-        self.assertTrue(glcli.push_allowed("acme/kb", "main"))
+        self.assertFalse(glcli.push_allowed("acme/kb", "main"))               # not without a grant
+        self.assertTrue(glcli.push_allowed("acme/kb", "main", kb_main=True))
         self.assertTrue(glcli.push_allowed("acme/team", "claude/4-matrix"))
         self.assertFalse(glcli.push_allowed("acme/team", "main"))

@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -40,6 +41,7 @@ def mcp_servers(home: Path) -> list[str]:
 
 
 ROUTINE_KINDS = ("inbox", "stale", "digest")
+KB_WRITE_KINDS = ("approved", "inbox", "stale")  # the only runs allowed to push to main of the knowledge base
 UNKNOWN_COST_USD = 2.0   # a run whose cost is unknown (timeout, crash) counts as this much against the daily limit
 
 
@@ -130,13 +132,24 @@ def job_dir(home: Path, job: Job) -> Path:
     return d
 
 
-def agent_env(home: Path) -> dict:
+def agent_env(home: Path, kb_grant: str | None = None) -> dict:
     """Minimal environment for Claude: no GitLab token, no askpass, no MCP secrets, bot identity for commits."""
     env = {k: v for k, v in os.environ.items() if k in PASS_ENV}
     env.update(AGENT_HOME=str(home), GIT_TERMINAL_PROMPT="0",
                GIT_AUTHOR_NAME=BOT_NAME, GIT_AUTHOR_EMAIL=BOT_EMAIL,
                GIT_COMMITTER_NAME=BOT_NAME, GIT_COMMITTER_EMAIL=BOT_EMAIL)
+    if kb_grant:
+        env["GL_KB_GRANT"] = kb_grant
     return env
+
+
+def issue_kb_grant(home: Path) -> str:
+    """A one-run token that lets gl.py push to main of the knowledge base (see gl.kb_grant_valid)."""
+    token = uuid.uuid4().hex
+    d = home / "state" / "kb-grants"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / token).write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+    return token
 
 
 def git_env() -> dict:
@@ -170,8 +183,9 @@ def run(job: Job, home: Path, context: str, timeout: int = 1800, claude: str | N
     claude = claude or os.environ.get("CLAUDE_BIN", str(Path.home() / ".local/bin/claude"))
     cmd = build_command(job, home, model or model_for(job, os.environ), render_prompt(job, context), claude)
     started = datetime.now(timezone.utc).isoformat()
+    grant = issue_kb_grant(home) if job.kind in KB_WRITE_KINDS else None
     try:
-        p = subprocess.run(cmd, cwd=cwd, env=agent_env(home), capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, cwd=cwd, env=agent_env(home, grant), capture_output=True, text=True, timeout=timeout)
         try:
             out = json.loads(p.stdout.strip().splitlines()[-1]) if p.stdout.strip() else {}
         except ValueError:
@@ -181,6 +195,9 @@ def run(job: Job, home: Path, context: str, timeout: int = 1800, claude: str | N
                         str(out.get("result") or p.stderr[-500:])[:2000])
     except subprocess.TimeoutExpired:
         res = RunResult(False, None, None, f"timeout after {timeout}s")
+    finally:
+        if grant:
+            (home / "state" / "kb-grants" / grant).unlink(missing_ok=True)
     log(home, {"started": started, "job": job.key, "reason": job.reason, "ok": res.ok, "cost_usd": res.cost_usd,
                "session_id": res.session_id, "summary": res.summary})
     return res

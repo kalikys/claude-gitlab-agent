@@ -63,7 +63,10 @@ are in the worker, not in the prompt.
 | read or leak the GitLab token | the token is not in Claude's environment; `secrets/` is denied to the sandbox and to the Read tool; only `gl.py` and `askpass.sh` read it |
 | reach the network from the shell | sandbox network is an allowlist of package registries; `allowUnsandboxedCommands: false`, `failIfUnavailable: true` |
 | touch another group or host | `gl.py` and `gitlab.py` check the group and the resolved project path; `askpass.sh` answers only for `https://gitlab.com` |
-| merge, or push to protected branches | `gl.py push` allows only `claude/*` branches; the one exception is `main` of the knowledge-base project |
+| merge, or push to protected branches | `gl.py push` allows only `claude/*` branches. `main` of the knowledge base only in runs the worker granted (approved / inbox / stale): a one-run token in the run's environment that must match a file in `state/`, which the sandbox can neither read nor write |
+| rewrite its own system prompt or tools | the knowledge base's `CLAUDE.md` is appended to every run's system prompt, so a push straight to `main` may never change `CLAUDE.md`, `scripts/`, `.gitlab-ci.yml` or `.gitlab/`; those change only through a merge request |
+| escape through links it plants | `gl.py` runs outside the sandbox but never follows a link inside `work/`: downloads are created with `O_EXCL \| O_NOFOLLOW` relative to a folder opened with `O_NOFOLLOW`; paths are resolved before checks; the worker replaces `work/CLAUDE.md` instead of writing through it |
+| move the boundaries `gl.py` checks | deployed as `<home>/app/gl.py`, it takes its home from its own location, not from `AGENT_HOME` |
 | change its own code or rules | the worker is deployed read-only; `agent/` comes from `main` of the worker project, i.e. after a human merge |
 | run hooks or git config while the token is in use | pushes go through a clean temporary bare repo with system/global config, hooks and credential helpers disabled |
 | write outside its job folder with `gl.py` | body and target files must resolve inside `~/gitlab-agent/work` |
@@ -71,10 +74,14 @@ are in the worker, not in the prompt.
 | retry a broken job forever | after 3 failures in a row the job stops and the bot asks for a human in the issue |
 | surface private team data elsewhere | the team project is excluded from group-wide search and activity; titles of its items and of confidential items are hidden outside it |
 
-What is policy rather than enforcement, and you should know it: writes to the knowledge base go straight to its
-`main` (that is the one branch exception above). The rule that they happen only after a group member adds the
-`approved` label lives in the prompts, and every such commit carries `Approved-by` and a link to the issue, so
-it is auditable rather than impossible. Protect `main` of the knowledge base in GitLab if you need it enforced.
+What is policy rather than enforcement, and you should know it: inside a granted run the agent decides what it
+writes to the knowledge base's documents. Results of issue work go in only after a group member adds the
+`approved` label (that is what starts the granted run), and every commit carries `Approved-by` or `Source:` with a
+link, so changes are auditable. Nightly inbox sorting and the staleness check write without a label, by design.
+Protect `main` of the knowledge base in GitLab if you want every change to go through review.
+
+`tests/test_security.py` pins these guardrails; the link-following download it covers was a real sandbox escape in
+an earlier version (found by an automated review and fixed before this release).
 
 Stop switches: `touch ~/gitlab-agent/STOP` pauses everything; the label `claude-pause` leaves one issue or MR alone.
 

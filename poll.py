@@ -174,10 +174,18 @@ def sync_agent_config(home: Path, pull: bool = True) -> None:
     set_writable(dst, False)
     if (src / "agent" / "CLAUDE.md").exists():
         (home / "work").mkdir(parents=True, exist_ok=True)
-        target = home / "work" / "CLAUDE.md"
-        set_writable(target, True)
-        shutil.copyfile(src / "agent" / "CLAUDE.md", target)
-        set_writable(target, False)
+        write_fresh(home / "work" / "CLAUDE.md", (src / "agent" / "CLAUDE.md").read_bytes())
+
+
+def write_fresh(target: Path, data: bytes, mode: int = 0o444) -> None:
+    """Replace a file the agent can reach (it may have swapped it for a link or a folder) without following links."""
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
 
 
 def set_writable(path: Path, on: bool) -> None:

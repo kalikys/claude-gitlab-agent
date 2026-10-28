@@ -21,7 +21,7 @@ from triggers import Job
 KB_PROJECT = config.kb_project()
 REMIND_DAYS, ARCHIVE_DAYS = 14, 28
 NOREPLY = re.compile(r"^\d+-(.+)@users\.noreply\.gitlab\.com$")
-DOC_PATH = re.compile(r"[\w./-]+\.md")
+DOC_PATH = re.compile(r"(?<![\w./-])[\w][\w./-]*\.md\b")  # checked again by kb_doc_ok before use
 
 
 def username_from(email: str, name: str) -> str:
@@ -213,10 +213,21 @@ def run_report(gl, state: State, home: Path, today: date, budget: float, owner: 
 
 # ---------- weekly ----------
 
+def kb_doc_ok(kb: Path, doc: str) -> bool:
+    """A document path taken from an issue: relative, inside the knowledge base, not an option, no '..'."""
+    p = Path(doc)
+    if not doc or doc.startswith(("-", "/")) or p.is_absolute() or ".." in p.parts:
+        return False
+    root = kb.resolve()
+    return root in (kb / p).resolve().parents
+
+
 def archive_doc(home: Path, doc: str, reason: str, source_url: str) -> bool:
     """Runs before any agent job of the weekly run, on the fresh clone made at start."""
     kb = home / "work" / "kb"
-    r = subprocess.run([sys.executable, str(home / "app" / "kbtool" / "kb.py"), "archive", doc, "--reason", reason],
+    if not kb_doc_ok(kb, doc):
+        return False
+    r = subprocess.run([sys.executable, str(home / "app" / "kbtool" / "kb.py"), "archive", "--reason", reason, "--", doc],
                        cwd=kb, env=glcli.safe_git_env(), capture_output=True, text=True)
     if r.returncode != 0:
         return False
@@ -224,7 +235,7 @@ def archive_doc(home: Path, doc: str, reason: str, source_url: str) -> bool:
         glcli._git("add", "-A", cwd=kb)
         glcli._git("-c", f"user.name={runner.BOT_NAME}", "-c", f"user.email={runner.BOT_EMAIL}", "commit", "-q", "-m",
                    f"kb: в архив {doc}\n\n{reason}\n\nSource: {source_url}", cwd=kb)
-        glcli.push_repo(str(kb), KB_PROJECT, "main")
+        glcli.push_repo(str(kb), KB_PROJECT, "main", kb_main=True)  # the worker's own commit, not the agent's
     except (RuntimeError, ValueError):
         return False
     return True

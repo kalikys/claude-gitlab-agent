@@ -362,12 +362,24 @@ def download(g: GitLab, project: str, ref: str, dest_dir: str) -> str:
     if not d.is_dir():
         raise ValueError(f"{d} is not a folder")
     data = g.get_bytes(f"projects/{pid}/uploads/{secret}/{urllib.parse.quote(name, safe='')}")
-    target, n = d / safe_name(name), 1
-    while target.exists():
-        target = d / f"{Path(safe_name(name)).stem}-{n}{Path(name).suffix}"
-        n += 1
-    target.write_bytes(data)
-    return str(target)
+    # gl.py runs outside the sandbox, the agent can write inside work/: never follow a link it planted.
+    # The folder is opened once without following links, the file is created relative to it, exclusively.
+    dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        base, n = safe_name(name), 1
+        candidate = base
+        while True:
+            try:
+                fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+                break
+            except FileExistsError:
+                candidate = f"{Path(base).stem}-{n}{Path(base).suffix}"
+                n += 1
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    finally:
+        os.close(dfd)
+    return str(d / candidate)
 
 
 def attachments(texts: list[str]) -> list[str]:
@@ -434,6 +446,11 @@ BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 
 
 def agent_home() -> Path:
+    """Deployed as <home>/app/gl.py, the home is where the file lives: the agent's environment must not move
+    the boundaries gl.py checks. Outside a deployment (tests, development) AGENT_HOME or the default is used."""
+    here = Path(__file__).resolve().parent
+    if here.name == "app":
+        return here.parent
     return Path(os.environ.get("AGENT_HOME", Path.home() / "gitlab-agent"))
 
 
@@ -481,22 +498,42 @@ def clone_repo(project: str, dest: str, remote_base: str = "https://gitlab.com")
 
 
 KB_PROJECT = config.kb_project()
+# Files of the knowledge base that steer the agent (CLAUDE.md is appended to every run's system prompt) or run
+# code (scripts, CI). A push straight to main never changes them: they change only through a merge request.
+KB_PROTECTED = ("CLAUDE.md", "scripts/", ".gitlab-ci.yml", ".gitlab/")
+GRANT = re.compile(r"^[0-9a-f]{32}$")
 
 
-def push_allowed(project: str, branch: str) -> bool:
-    """main only for the knowledge base (design: approved work goes straight in); elsewhere only claude/* branches."""
+def kb_grant_valid() -> bool:
+    """The worker grants a run the right to push to main of the knowledge base (approved / inbox / stale jobs) by
+    a file in state/, which the sandbox can neither read nor write, named after a token in the run's environment."""
+    token = os.environ.get("GL_KB_GRANT", "")
+    return bool(GRANT.match(token)) and (agent_home() / "state" / "kb-grants" / token).is_file()
+
+
+def push_allowed(project: str, branch: str, kb_main: bool = False) -> bool:
+    """main of the knowledge base only when granted; everywhere else only claude/* branches."""
     if project == KB_PROJECT and branch == "main":
-        return True
+        return kb_main
     return branch.startswith("claude/")
 
 
-def push_repo(src: str, project: str, branch: str, remote_base: str = "https://gitlab.com") -> str:
+def protected_changes(cache: Path, remote: str) -> list[str]:
+    """Paths under KB_PROTECTED that the outgoing commits change compared with the remote main."""
+    _git("fetch", "-q", "--no-tags", remote, "+refs/heads/main:refs/heads/base", cwd=cache)
+    changed = _git("diff", "--name-only", "base", "outgoing", cwd=cache).stdout.split()
+    return [p for p in changed if p in KB_PROTECTED or any(p.startswith(d) for d in KB_PROTECTED if d.endswith("/"))]
+
+
+def push_repo(src: str, project: str, branch: str, remote_base: str = "https://gitlab.com",
+              kb_main: bool = False) -> str:
     """Push HEAD of a work repo to a branch. Goes through a clean temporary repo, so nothing configured
-    in the agent's repo (hooks, helpers, remotes) runs while the token is in play."""
+    in the agent's repo (hooks, helpers, remotes) runs while the token is in play.
+    kb_main: the caller may push to main of the knowledge base (worker code, or a granted agent run)."""
     check_group(project)
     if not BRANCH.match(branch) or ".." in branch or branch == "HEAD":
         raise ValueError(f"bad branch name {branch!r}")
-    if not push_allowed(project, branch):
+    if not push_allowed(project, branch, kb_main):
         raise ValueError(f"push to {project}:{branch} not allowed: use a claude/<iid>-<slug> branch and a merge request")
     repo = inside_work(src)
     if not (repo / ".git").is_dir():
@@ -506,6 +543,11 @@ def push_repo(src: str, project: str, branch: str, remote_base: str = "https://g
     try:
         _git("init", "-q", "--bare", str(cache))
         _git("fetch", "-q", "--no-tags", str(repo), "+HEAD:refs/heads/outgoing", cwd=cache)
+        if project == KB_PROJECT and branch == "main":
+            touched = protected_changes(cache, f"{remote_base}/{project}.git")
+            if touched:
+                raise ValueError(f"push to {project}:main may not change {', '.join(touched)}: "
+                                 "open a claude/<iid>-<slug> branch and a merge request")
         _git("push", "-q", f"{remote_base}/{project}.git", f"refs/heads/outgoing:refs/heads/{branch}", cwd=cache)
         return _git("rev-parse", "refs/heads/outgoing", cwd=cache).stdout.strip()
     finally:
@@ -641,7 +683,7 @@ def main(argv=None, g: GitLab | None = None):
         elif a.cmd == "download":
             print("saved", download(g, a.project, a.ref, a.to))
         elif a.cmd == "push":
-            print("pushed", push_repo(a.dir, a.project, a.branch), "to", a.branch)
+            print("pushed", push_repo(a.dir, a.project, a.branch, kb_main=kb_grant_valid()), "to", a.branch)
         elif a.cmd == "members":
             print(members_text(g))
     except (ValueError, RuntimeError) as e:
