@@ -1,0 +1,11 @@
+# Claude Code's sandbox uses bubblewrap, which needs unprivileged user namespaces. Hosts that restrict them
+# (Ubuntu 24.04+: kernel.apparmor_restrict_unprivileged_userns=1) need a profile that allows userns for bwrap only.
+# Install as /etc/apparmor.d/bwrap, then: sudo apparmor_parser -r /etc/apparmor.d/bwrap
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/bwrap>
+}

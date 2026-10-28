@@ -1,0 +1,12 @@
+# ~/.config/systemd/user/gitlab-agent-remind.service of the worker's Unix user (systemd --user).
+[Unit]
+Description=GitLab agent: напоминания людям
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/gitlab-agent/secrets/env
+Environment=AGENT_HOME=%h/gitlab-agent
+WorkingDirectory=%h/gitlab-agent/app
+ExecStart=/usr/bin/python3 %h/gitlab-agent/app/schedule.py remind
+TimeoutStartSec=2h

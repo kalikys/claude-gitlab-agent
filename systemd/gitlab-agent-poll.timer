@@ -1,0 +1,11 @@
+# ~/.config/systemd/user/gitlab-agent-poll.timer: a poll every 30 seconds after the previous one finished.
+[Unit]
+Description=GitLab agent: опрос задач
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+# ~/.config/systemd/user/gitlab-agent-inbox.timer (VM timezone Asia/Tbilisi).
+[Unit]
+Description=GitLab agent: разбор inbox базы знаний
+
+[Timer]
+OnCalendar=*-*-* 20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

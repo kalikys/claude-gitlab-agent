@@ -1,0 +1,10 @@
+# ~/.config/systemd/user/gitlab-agent-remind.timer (VM timezone Asia/Tbilisi). Weekdays only.
+[Unit]
+Description=GitLab agent: напоминания людям
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 10:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
